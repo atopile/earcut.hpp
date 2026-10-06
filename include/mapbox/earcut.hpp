@@ -51,8 +51,16 @@ private:
         Node* prev = nullptr;
         Node* next = nullptr;
 
-        // z-order curve value
+        // Owning bridge block during hole elimination
         int32_t z = 0;
+
+        // Implicit treap of live ring edges, used only during hole elimination.
+        Node* left = nullptr;
+        Node* right = nullptr;
+        Node* parent = nullptr;
+        std::size_t subtreeSize = 1;
+        uint32_t priority = 0;
+        double minX, minY, maxX, maxY;
 
         // original index in polygon
         const N i : (sizeof(N) * 8 - 1);
@@ -60,9 +68,10 @@ private:
         // indicates whether this is a steiner point
         N steiner : 1;
 
-        // previous and next nodes in z-order
-        Node* prevZ = nullptr;
-        Node* nextZ = nullptr;
+        // Intrusive vertex-grid cell list; no per-cell allocation
+        Node* prevGrid = nullptr;
+        Node* nextGrid = nullptr;
+        std::size_t cell = std::numeric_limits<std::size_t>::max();
     };
 
     // Cache-optimized Triangle structure for repeated geometric tests
@@ -106,7 +115,7 @@ private:
     Node* filterPoints(Node* start, Node* end = nullptr);
     void earcutLinked(Node* ear);
     bool isEar(Node* ear);
-    bool isEarHashed(Node* ear);
+    bool isEarIndexed(Node* ear);
     Node* cureLocalIntersections(Node* start);
     void splitEarcut(Node* start);
     template <typename Polygon>
@@ -118,10 +127,25 @@ private:
     void growBlock(Node* head, Node* tail);
     Node* liveBlockHead(std::size_t b);
     Node* liveBlockStop(std::size_t b);
+    Node* segmentRoot = nullptr;
+    uint32_t priorityState = 1;
+    static std::size_t treeSize(const Node* p) { return p ? p->subtreeSize : 0; }
+    static void updateTree(Node* p);
+    static void updateAncestors(Node* p);
+    static Node* mergeTrees(Node* left, Node* right);
+    static void splitTree(Node* root, std::size_t count, Node*& left, Node*& right);
+    static std::size_t treeRank(const Node* p);
+    Node* buildSegmentTree(Node* head, Node* stop);
+    void insertSegments(Node* bridge, Node* stop);
+    void removeSegment(Node* p);
+    template <typename Overlaps, typename Visit>
+    bool visitTree(Node* root, std::size_t begin, std::size_t end, const Overlaps& overlaps, const Visit& visit);
+    template <typename Overlaps, typename Visit>
+    bool visitRing(Node* head, Node* stop, const Overlaps& overlaps, const Visit& visit);
     bool sectorContainsSector(const Node* m, const Node* p);
-    void indexCurve(Node* start);
-    Node* sortLinked(Node* list);
-    int32_t zOrder(const double x_, const double y_);
+    void indexGrid(Node* start);
+    std::size_t gridColumn(double x) const;
+    std::size_t gridRow(double y) const;
     Node* getLeftmost(Node* start);
     bool pointInTriangle(double ax, double ay, double bx, double by, double cx, double cy, double px, double py) const;
     bool isValidDiagonal(Node* a, Node* b);
@@ -141,9 +165,9 @@ private:
     // set by filterPoints whenever it removes at least one node; read by earcutLinked's stall
     // handler to decide whether another clip pass is worth attempting before the costlier stages
     bool filteredOut = false;
-    double minX, maxX;
-    double minY, maxY;
-    double inv_size = 0;
+    double minX = 0, minY = 0, gridWidth = 0, gridHeight = 0;
+    std::size_t columns = 1, rows = 1;
+    std::vector<Node*> cells;
 
     template <typename T, typename Alloc = std::allocator<T>>
     class ObjectPool {
@@ -219,8 +243,6 @@ private:
 
     std::unique_ptr<ObjectPool<Node>> nodes;
     std::vector<Node*> holeQueue;
-    // reused scratch buffer for sortLinked: materialize the z-linked ring, std::sort, relink
-    std::vector<Node*> sortBuffer;
 
     // Block-bbox index for findHoleBridge (issue #183): one [minX,minY,maxX,maxY] bbox per K
     // consecutive ring edges, so the leftward-ray scan can skip whole blocks in O(1) instead of
@@ -244,14 +266,14 @@ private:
 template <typename N>
 template <typename Polygon>
 void Earcut<N>::operator()(const Polygon& points) {
-    // reset
+    // Clear before early returns too, so this scratch object can be reused.
+    if (nodes) nodes->clear();
+    holeQueue.clear();
     indices.clear();
     vertices = 0;
 
     if (points.empty()) return;
 
-    double x;
-    double y;
     int threshold = 80;
     std::size_t len = 0;
 
@@ -273,31 +295,9 @@ void Earcut<N>::operator()(const Polygon& points) {
 
     if (points.size() > 1) outerNode = eliminateHoles(points, outerNode);
 
-    // if the shape is not too simple, we'll use z-order curve hash later; calculate polygon bbox
     hashing = threshold < 0;
-    if (hashing) {
-        Node* p = outerNode->next;
-        minX = maxX = outerNode->x;
-        minY = maxY = outerNode->y;
-        do {
-            x = p->x;
-            y = p->y;
-            minX = std::min<double>(minX, x);
-            minY = std::min<double>(minY, y);
-            maxX = std::max<double>(maxX, x);
-            maxY = std::max<double>(maxY, y);
-            p = p->next;
-        } while (p != outerNode);
-
-        // minX, minY and inv_size are later used to transform coords into integers for z-order calculation
-        inv_size = std::max<double>(maxX - minX, maxY - minY);
-        inv_size = inv_size != .0 ? (32767. / inv_size) : .0;
-    }
 
     earcutLinked(outerNode);
-
-    nodes->clear();
-    holeQueue.clear();
 }
 
 // create a circular doubly linked list from polygon points in the specified winding order
@@ -373,8 +373,8 @@ template <typename N>
 void Earcut<N>::earcutLinked(Node* ear) {
     if (!ear) return;
 
-    // interlink polygon nodes in z-order
-    if (hashing) indexCurve(ear);
+    // Rebuild for each ring, including both halves after a diagonal split.
+    if (hashing) indexGrid(ear);
 
     Node* stop = ear;
     Node* prev;
@@ -387,7 +387,7 @@ void Earcut<N>::earcutLinked(Node* ear) {
         next = ear->next;
 
         // reflex check is hoisted here to avoid constructing the Triangle for reflex corners
-        if (area(prev, ear, next) < 0 && (hashing ? isEarHashed(ear) : isEar(ear))) {
+        if (area(prev, ear, next) < 0 && (hashing ? isEarIndexed(ear) : isEar(ear))) {
             // cut off the triangle
             indices.emplace_back(prev->i);
             indices.emplace_back(ear->i);
@@ -452,38 +452,21 @@ bool Earcut<N>::isEar(Node* ear) {
 }
 
 template <typename N>
-bool Earcut<N>::isEarHashed(Node* ear) {
+bool Earcut<N>::isEarIndexed(Node* ear) {
     const Node* a = ear->prev;
-    const Node* b = ear;
     const Node* c = ear->next;
-
-    // reflex check is hoisted into the earcutLinked caller
-    const Triangle tri(a, b, c);
-
-    // z-order range for the current triangle bbox;
-    const int32_t minZ = zOrder(tri.minX, tri.minY);
-    const int32_t maxZ = zOrder(tri.maxX, tri.maxY);
-
-    // first look for points inside the triangle in increasing z-order
-    Node* p = ear->nextZ;
-
-    while (p && p->z <= maxZ) {
-        if (p != ear->next && tri.inBBox(p->x, p->y) && tri.containsPointExceptFirst(p->x, p->y) &&
-            area(p->prev, p, p->next) >= 0)
-            return false;
-        p = p->nextZ;
+    const Triangle tri(a, ear, c);
+    const std::size_t x0 = gridColumn(tri.minX), x1 = gridColumn(tri.maxX);
+    const std::size_t y0 = gridRow(tri.minY), y1 = gridRow(tri.maxY);
+    for (std::size_t y = y0; y <= y1; ++y) {
+        for (std::size_t x = x0; x <= x1; ++x) {
+            for (Node* p = cells[y * columns + x]; p; p = p->nextGrid) {
+                if (p != a && p != ear && p != c && tri.inBBox(p->x, p->y) &&
+                    tri.containsPointExceptFirst(p->x, p->y) && area(p->prev, p, p->next) >= 0)
+                    return false;
+            }
+        }
     }
-
-    // then look for points in decreasing z-order
-    p = ear->prevZ;
-
-    while (p && p->z >= minZ) {
-        if (p != ear->next && tri.inBBox(p->x, p->y) && tri.containsPointExceptFirst(p->x, p->y) &&
-            area(p->prev, p, p->next) >= 0)
-            return false;
-        p = p->prevZ;
-    }
-
     return true;
 }
 
@@ -575,6 +558,9 @@ typename Earcut<N>::Node* Earcut<N>::eliminateHoles(const Polygon& points, Node*
     buildBlockIndex(vertices, holeQueue.size());
     indexSegment(outerNode, outerNode);
 
+    priorityState = 1;
+    segmentRoot = buildSegmentTree(outerNode, outerNode);
+
     // process holes from left to right; indexActive lets removeNode keep block bboxes live as
     // filterPoints heals edges during merges (see growBlock)
     indexActive = true;
@@ -582,6 +568,7 @@ typename Earcut<N>::Node* Earcut<N>::eliminateHoles(const Polygon& points, Node*
         outerNode = eliminateHole(holeQueue[i], outerNode);
     }
     indexActive = false;
+    segmentRoot = nullptr;
 
     // collapse collinear/coincident points across the whole merged ring once before clipping
     return filterPoints(outerNode);
@@ -603,6 +590,7 @@ typename Earcut<N>::Node* Earcut<N>::eliminateHole(Node* hole, Node* outerNode) 
     // bboxes stay valid (conservative) supersets.
     Node* bridge2 = bridgeReverse->next;
     indexSegment(bridge, bridge2->next);
+    insertSegments(bridge, bridge2->next);
 
     // heal collinear/coincident points around the two new slit edges
     filterPoints(bridgeReverse, bridgeReverse->next);
@@ -612,7 +600,6 @@ typename Earcut<N>::Node* Earcut<N>::eliminateHole(Node* hole, Node* outerNode) 
 // David Eberly's algorithm for finding a bridge between hole and outer polygon
 template <typename N>
 typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode) {
-    Node* p = outerNode;
     double hx = hole->x;
     double hy = hole->y;
     double qx = -std::numeric_limits<double>::max();
@@ -621,7 +608,7 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
     // find a segment intersected by a ray from the hole's leftmost Vertex to the left;
     // segment's endpoint with lesser x will be potential connection Vertex,
     // unless they intersect at a vertex, then choose the vertex
-    if (equals(hole, p)) return p;
+    if (equals(hole, outerNode)) return outerNode;
 
     // scan blocks; skip any whose bbox can't hold a crossing that beats qx and lies left of hx
     // (the prune Morton order can't express — explicit per-axis [minY,maxY]/[minX,maxX])
@@ -629,23 +616,35 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
         if (hy < blockBBox[g + 1] || hy > blockBBox[g + 3] || blockBBox[g] > hx || blockBBox[g + 2] <= qx) continue;
 
         // ensure the walk's exclusive bound is live so we don't overrun into other blocks
-        const Node* stop = liveBlockStop(b);
-        p = liveBlockHead(b);
-        do {
-            if (p->prev->next == p) { // skip nodes removed by filterPoints (stale in the index)
-                if (equals(hole, p->next))
-                    return p->next;
-                else if (hy <= p->y && hy >= p->next->y && p->next->y != p->y) {
-                    double x = p->x + (hy - p->y) * (p->next->x - p->x) / (p->next->y - p->y);
-                    if (x <= hx && x > qx) {
-                        qx = x;
-                        m = p->x < p->next->x ? p : p->next;
-                        if (x == hx) return m; // hole touches outer segment; pick leftmost endpoint
+        Node* stop = liveBlockStop(b);
+        Node* head = liveBlockHead(b);
+        Node* touching = nullptr;
+        const bool found = visitRing(
+            head,
+            stop,
+            [&](const Node* node) {
+                return !(hy < node->minY || hy > node->maxY || node->minX > hx || node->maxX <= qx);
+            },
+            [&](Node* p) {
+                if (p->prev->next == p) { // skip nodes removed by filterPoints (stale in the index)
+                    if (equals(hole, p->next)) {
+                        touching = p->next;
+                        return true;
+                    } else if (hy <= p->y && hy >= p->next->y && p->next->y != p->y) {
+                        double x = p->x + (hy - p->y) * (p->next->x - p->x) / (p->next->y - p->y);
+                        if (x <= hx && x > qx) {
+                            qx = x;
+                            m = p->x < p->next->x ? p : p->next;
+                            if (x == hx) {
+                                touching = m;
+                                return true;
+                            } // hole touches outer segment; pick leftmost endpoint
+                        }
                     }
                 }
-            }
-            p = p->next;
-        } while (p != stop);
+                return false;
+            });
+        if (found) return touching;
     }
 
     if (!m) return 0;
@@ -665,24 +664,30 @@ typename Earcut<N>::Node* Earcut<N>::findHoleBridge(Node* hole, Node* outerNode)
         if (blockBBox[g + 2] < mx || blockBBox[g] > hx || blockBBox[g + 3] < tminY || blockBBox[g + 1] > tmaxY)
             continue;
 
-        const Node* stop = liveBlockStop(b);
-        p = liveBlockHead(b);
-        do {
-            if (p->prev->next == p && hx >= p->x && p->x >= mx && hx != p->x && // skip dead nodes
-                pointInTriangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, p->x, p->y)) {
-                const double tanCur = std::abs(hy - p->y) / (hx - p->x); // tangential
+        Node* stop = liveBlockStop(b);
+        Node* head = liveBlockHead(b);
+        visitRing(
+            head,
+            stop,
+            [&](const Node* node) {
+                return !(node->maxX < mx || node->minX > hx || node->maxY < tminY || node->minY > tmaxY);
+            },
+            [&](Node* p) {
+                if (p->prev->next == p && hx >= p->x && p->x >= mx && hx != p->x && // skip dead nodes
+                    pointInTriangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, p->x, p->y)) {
+                    const double tanCur = std::abs(hy - p->y) / (hx - p->x); // tangential
 
-                // if hole point sits on p's horizontal edge (T-junction touch): the bridge runs
-                // along that edge — locallyInside rejects it as collinear, but it's valid
-                if ((locallyInside(p, hole) || (p->y == hy && p->next->y == hy && p->next->x > hx)) &&
-                    (tanCur < tanMin ||
-                     (tanCur == tanMin && (p->x > m->x || (p->x == m->x && sectorContainsSector(m, p)))))) {
-                    m = p;
-                    tanMin = tanCur;
+                    // if hole point sits on p's horizontal edge (T-junction touch): the bridge runs
+                    // along that edge — locallyInside rejects it as collinear, but it's valid
+                    if ((locallyInside(p, hole) || (p->y == hy && p->next->y == hy && p->next->x > hx)) &&
+                        (tanCur < tanMin ||
+                         (tanCur == tanMin && (p->x > m->x || (p->x == m->x && sectorContainsSector(m, p)))))) {
+                        m = p;
+                        tanMin = tanCur;
+                    }
                 }
-            }
-            p = p->next;
-        } while (p != stop);
+                return false;
+            });
     }
 
     return m;
@@ -742,6 +747,146 @@ void Earcut<N>::growBlock(Node* head, Node* tail) {
     if (tail->y > blockBBox[g + 3]) blockBBox[g + 3] = tail->y;
 }
 
+// The tree follows live ring order. Its boxes bound individual directed edges,
+// so a block that has grown through hole splices need not walk every inserted edge.
+// Original block pruning and the order of candidate visits remain unchanged.
+template <typename N>
+void Earcut<N>::updateTree(Node* p) {
+    p->subtreeSize = 1 + treeSize(p->left) + treeSize(p->right);
+    p->minX = std::min(p->x, p->next->x);
+    p->minY = std::min(p->y, p->next->y);
+    p->maxX = std::max(p->x, p->next->x);
+    p->maxY = std::max(p->y, p->next->y);
+    for (const Node* child : {p->left, p->right}) {
+        if (!child) continue;
+        p->minX = std::min(p->minX, child->minX);
+        p->minY = std::min(p->minY, child->minY);
+        p->maxX = std::max(p->maxX, child->maxX);
+        p->maxY = std::max(p->maxY, child->maxY);
+    }
+}
+
+template <typename N>
+void Earcut<N>::updateAncestors(Node* p) {
+    for (; p; p = p->parent) updateTree(p);
+}
+
+template <typename N>
+typename Earcut<N>::Node* Earcut<N>::mergeTrees(Node* left, Node* right) {
+    if (!left || !right) {
+        Node* root = left ? left : right;
+        if (root) root->parent = nullptr;
+        return root;
+    }
+    Node* root;
+    if (left->priority < right->priority) {
+        root = left;
+        root->right = mergeTrees(root->right, right);
+        root->right->parent = root;
+    } else {
+        root = right;
+        root->left = mergeTrees(left, root->left);
+        root->left->parent = root;
+    }
+    root->parent = nullptr;
+    updateTree(root);
+    return root;
+}
+
+template <typename N>
+void Earcut<N>::splitTree(Node* root, std::size_t count, Node*& left, Node*& right) {
+    if (!root) {
+        left = right = nullptr;
+        return;
+    }
+    if (count <= treeSize(root->left)) {
+        right = root;
+        splitTree(root->left, count, left, root->left);
+        if (root->left) root->left->parent = root;
+    } else {
+        left = root;
+        splitTree(root->right, count - treeSize(root->left) - 1, root->right, right);
+        if (root->right) root->right->parent = root;
+    }
+    root->parent = nullptr;
+    updateTree(root);
+}
+
+template <typename N>
+std::size_t Earcut<N>::treeRank(const Node* p) {
+    std::size_t rank = treeSize(p->left);
+    for (; p->parent; p = p->parent) {
+        if (p == p->parent->right) rank += treeSize(p->parent->left) + 1;
+    }
+    return rank;
+}
+
+template <typename N>
+typename Earcut<N>::Node* Earcut<N>::buildSegmentTree(Node* head, Node* stop) {
+    Node* root = nullptr;
+    Node* p = head;
+    do {
+        // Deterministic priorities keep the implicit treap balanced without depending on coordinates.
+        priorityState ^= priorityState << 13;
+        priorityState ^= priorityState >> 17;
+        priorityState ^= priorityState << 5;
+        p->priority = priorityState;
+        updateTree(p);
+        root = mergeTrees(root, p);
+        p = p->next;
+    } while (p != stop);
+    return root;
+}
+
+template <typename N>
+void Earcut<N>::insertSegments(Node* bridge, Node* stop) {
+    Node* left;
+    Node* right;
+    splitTree(segmentRoot, treeRank(bridge) + 1, left, right);
+    Node* inserted = buildSegmentTree(bridge->next, stop);
+    segmentRoot = mergeTrees(mergeTrees(left, inserted), right);
+    updateAncestors(bridge);
+}
+
+template <typename N>
+void Earcut<N>::removeSegment(Node* p) {
+    // The two local filter windows can revisit a bridge already removed by the first.
+    if (!p->parent && p != segmentRoot) return;
+    Node* parent = p->parent;
+    Node* merged = mergeTrees(p->left, p->right);
+    if (parent) {
+        if (parent->left == p)
+            parent->left = merged;
+        else
+            parent->right = merged;
+    } else
+        segmentRoot = merged;
+    if (merged) merged->parent = parent;
+    updateAncestors(parent);
+    p->left = p->right = p->parent = nullptr;
+}
+
+template <typename N>
+template <typename Overlaps, typename Visit>
+bool Earcut<N>::visitTree(
+    Node* root, std::size_t begin, std::size_t end, const Overlaps& overlaps, const Visit& visit) {
+    if (!root || begin >= end || !overlaps(root)) return false;
+    const std::size_t rank = treeSize(root->left);
+    if (begin < rank && visitTree(root->left, begin, std::min(end, rank), overlaps, visit)) return true;
+    if (begin <= rank && end > rank && visit(root)) return true;
+    return end > rank + 1 &&
+           visitTree(root->right, begin > rank + 1 ? begin - rank - 1 : 0, end - rank - 1, overlaps, visit);
+}
+
+template <typename N>
+template <typename Overlaps, typename Visit>
+bool Earcut<N>::visitRing(Node* head, Node* stop, const Overlaps& overlaps, const Visit& visit) {
+    const std::size_t begin = treeRank(head), end = treeRank(stop);
+    if (begin < end) return visitTree(segmentRoot, begin, end, overlaps, visit);
+    return visitTree(segmentRoot, begin, treeSize(segmentRoot), overlaps, visit) ||
+           visitTree(segmentRoot, 0, end, overlaps, visit);
+}
+
 // the block's head node can be removed by filterPoints during merges; advance it to the next live
 // node so the walk doesn't start on (and immediately terminate at) a dead node. For the single
 // full-ring seed block (head == stop) the same forward advance keeps them equal, so the do-while
@@ -768,68 +913,51 @@ bool Earcut<N>::sectorContainsSector(const Node* m, const Node* p) {
     return area(m->prev, m, p->prev) < 0 && area(p->next, m, m->next) < 0;
 }
 
-// interlink polygon nodes in z-order
+// Rebuild for each ring, including both halves after a diagonal split.
 template <typename N>
-void Earcut<N>::indexCurve(Node* start) {
-    assert(start);
+void Earcut<N>::indexGrid(Node* start) {
+    std::size_t count = 0;
+    minX = start->x;
+    minY = start->y;
+    double maxX = minX, maxY = minY;
     Node* p = start;
-
     do {
-        // always (re)compute: z may still hold a block index left over from eliminateHoles
-        p->z = zOrder(p->x, p->y);
-        p->prevZ = p->prev;
-        p->nextZ = p->next;
+        minX = std::min(minX, p->x);
+        minY = std::min(minY, p->y);
+        maxX = std::max(maxX, p->x);
+        maxY = std::max(maxY, p->y);
+        ++count;
         p = p->next;
     } while (p != start);
-
-    p->prevZ->nextZ = nullptr;
-    p->prevZ = nullptr;
-
-    sortLinked(p);
+    gridWidth = maxX - minX;
+    gridHeight = maxY - minY;
+    // About four vertices per cell. Cap each axis before converting to an integer.
+    const double target = std::max(1.0, double(count) / 4);
+    const double aspect = gridHeight > 0 ? gridWidth / gridHeight : target;
+    columns = std::size_t(std::max(1.0, std::min(4096.0, std::sqrt(target * aspect))));
+    rows = std::size_t(std::max(1.0, std::min(4096.0, target / static_cast<double>(columns))));
+    cells.assign(columns * rows, nullptr);
+    p = start;
+    do {
+        p->cell = gridRow(p->y) * columns + gridColumn(p->x);
+        p->prevGrid = nullptr;
+        p->nextGrid = cells[p->cell];
+        if (p->nextGrid) p->nextGrid->prevGrid = p;
+        cells[p->cell] = p;
+        p = p->next;
+    } while (p != start);
 }
 
-// Sort the z-linked ring by z-order. Upstream earcut replaced its linked merge sort with an
-// array sort (materialize node refs → sort → relink); in C++ std::sort over a contiguous
-// Node* buffer inlines the comparator fully and beats both a linked merge sort and a hand radix
-// (measured on the MVT tiles fixture) — JS's rejection of native Array.sort does not transfer.
 template <typename N>
-typename Earcut<N>::Node* Earcut<N>::sortLinked(Node* list) {
-    assert(list);
-    // list is a null-terminated nextZ chain (see indexCurve); walk it into the scratch buffer
-    sortBuffer.clear();
-    for (Node* p = list; p; p = p->nextZ) sortBuffer.push_back(p);
-
-    std::sort(sortBuffer.begin(), sortBuffer.end(), [](const Node* a, const Node* b) { return a->z < b->z; });
-
-    // relink in sorted order
-    Node* prev = nullptr;
-    for (Node* p : sortBuffer) {
-        p->prevZ = prev;
-        if (prev) prev->nextZ = p;
-        prev = p;
-    }
-    prev->nextZ = nullptr;
-    return sortBuffer.front();
+std::size_t Earcut<N>::gridColumn(double x) const {
+    return std::size_t(std::max(
+        0.0, std::min(double(columns - 1), gridWidth > 0 ? (x - minX) / gridWidth * static_cast<double>(columns) : 0)));
 }
 
-// z-order of a Vertex given coords and size of the data bounding box
 template <typename N>
-int32_t Earcut<N>::zOrder(const double x_, const double y_) {
-    // coords are transformed into non-negative 15-bit integer range
-    int32_t x = static_cast<int32_t>((x_ - minX) * inv_size);
-    int32_t y = static_cast<int32_t>((y_ - minY) * inv_size);
-
-    x = (x | (x << 8)) & 0x00FF00FF;
-    x = (x | (x << 4)) & 0x0F0F0F0F;
-    x = (x | (x << 2)) & 0x33333333;
-    x = (x | (x << 1)) & 0x55555555;
-
-    y = (y | (y << 8)) & 0x00FF00FF;
-    y = (y | (y << 4)) & 0x0F0F0F0F;
-    y = (y | (y << 2)) & 0x33333333;
-    y = (y | (y << 1)) & 0x55555555;
-
-    return x | (y << 1);
+std::size_t Earcut<N>::gridRow(double y) const {
+    return std::size_t(std::max(
+        0.0, std::min(double(rows - 1), gridHeight > 0 ? (y - minY) / gridHeight * static_cast<double>(rows) : 0)));
 }
 
 // find the leftmost node of a polygon ring
@@ -1004,11 +1132,21 @@ void Earcut<N>::removeNode(Node* p) {
     p->next->prev = p->prev;
     p->prev->next = p->next;
 
-    if (p->prevZ) p->prevZ->nextZ = p->nextZ;
-    if (p->nextZ) p->nextZ->prevZ = p->prevZ;
+    if (p->cell != std::numeric_limits<std::size_t>::max()) {
+        if (p->prevGrid)
+            p->prevGrid->nextGrid = p->nextGrid;
+        else
+            cells[p->cell] = p->nextGrid;
+        if (p->nextGrid) p->nextGrid->prevGrid = p->prevGrid;
+        p->cell = std::numeric_limits<std::size_t>::max();
+    }
 
     // keep the hole-bridge index's block bboxes covering the healed prev->next edge
-    if (indexActive) growBlock(p->prev, p->next);
+    if (indexActive) {
+        growBlock(p->prev, p->next);
+        removeSegment(p);
+        updateAncestors(p->prev);
+    }
 }
 } // namespace detail
 
